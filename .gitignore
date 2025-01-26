@@ -1,6 +1,5 @@
 # Compiler files
 cache/
-out/
 
 # Ignores development broadcast logs
 !/broadcast
@@ -10,5 +9,19 @@ out/
 # Docs
 docs/
 
-# Dotenv file
+# Foundry
+out/
+lib/
+.cache/
+coverage/
+
+# Environment Variables
 .env
+
+# Editor Files
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
