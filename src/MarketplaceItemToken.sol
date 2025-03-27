@@ -7,6 +7,8 @@ import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC721URIStorage} from "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
+import "forge-std/console.sol";
+
 contract MarketplaceItemToken is ERC721, ERC721URIStorage, Ownable {
     /* ========== STATE VARIABLES ========== */
     uint256 private _nextTokenId;
@@ -26,10 +28,13 @@ contract MarketplaceItemToken is ERC721, ERC721URIStorage, Ownable {
     /* ========== CONSTRUCTOR ========== */
     constructor(
         address _owner
-    ) ERC721("MarketplaceItem", "MI") Ownable(_owner) {}
+    ) ERC721("MarketplaceItem", "MI") Ownable(_owner) {
+        console.log("MarketplaceItemToken deployed: owner is %s", _owner);
+    }
 
     /* ========== EXTERNAL FUNCTIONS ========== */
-    function burn(uint256 tokenId) external onlyOwner {
+    function burn(uint256 tokenId) external {
+        console.log("burning token msg.sender: %s", msg.sender);
         _burn(tokenId);
     }
 

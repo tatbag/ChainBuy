@@ -9,11 +9,9 @@ import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-
-import {Script} from "forge-std/Script.sol";
 import "forge-std/console.sol";
 
-contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
+contract MarketplaceV2opt is ReentrancyGuard, Pausable, IERC721Receiver {
     /* ==================================== */
     /*             TYPE DECLARATIONS        */
     /* ==================================== */
@@ -23,7 +21,7 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
         address seller;
         address tokenAddress;
         uint256 tokenId;
-        uint256 price; // Price in wei
+        uint256 price;
         bool isSold;
     }
 
@@ -41,7 +39,7 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     // Listing counter
     uint256 private _listingIdCount;
 
-    // Contract references
+    // Contract references (immutable for gas savings)
     MarketplaceItemToken private immutable itemToken;
     FeeManager private immutable feeManager;
     MPRoles private immutable mpRoles;
@@ -49,6 +47,10 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     // Mappings for listings and seller info
     mapping(uint256 => Listing) public listings;
     mapping(address => SellerInfo) private sellers;
+
+    // Optimization: mapping that tracks whether a given external NFT is already listed.
+    // The key is keccak256(abi.encodePacked(tokenAddress, tokenId)).
+    mapping(bytes32 => bool) private _isListed;
 
     /* ==================================== */
     /*               EVENTS                 */
@@ -67,7 +69,6 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
         address indexed tokenAddress,
         uint256 tokenId
     );
-
     event ItemSold(
         uint256 indexed listingId,
         address indexed seller,
@@ -76,14 +77,16 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
         uint256 tokenId,
         uint256 price
     );
-
     event SellerFundsWithdrawn(address indexed seller, uint256 indexed amount);
 
-    /* ========== CUSTOM MODIFIERS ========== */
+    /* ==================================== */
+    /*             CUSTOM MODIFIERS         */
+    /* ==================================== */
+
     modifier onlyAdmin() {
         require(
             mpRoles.hasRole(mpRoles.ADMIN_ROLE(), msg.sender),
-            "Marketplace: caller is not an admin"
+            "MarketplaceV2opt: caller is not an admin"
         );
         _;
     }
@@ -91,7 +94,7 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     modifier onlyVerified() {
         require(
             mpRoles.hasRole(mpRoles.VERIFIED_ROLE(), msg.sender),
-            "Marketplace: caller is not a verified user"
+            "MarketplaceV2opt: caller is not a verified user"
         );
         _;
     }
@@ -101,11 +104,10 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     /* ==================================== */
 
     constructor() {
-        // Deploy token, roles and fee manager contracts
-        console.log("Deploying contracts..., msg sender = ", msg.sender);
+        console.log("Deploying MarketplaceV2opt, msg.sender =", msg.sender);
         mpRoles = new MPRoles(msg.sender);
-        itemToken = new MarketplaceItemToken(address(this));
         feeManager = new FeeManager(msg.sender, msg.sender, 250, 100); // 2.5% fee, 1% revoke fee
+        itemToken = new MarketplaceItemToken(msg.sender);
     }
 
     /* ==================================== */
@@ -113,8 +115,8 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     /* ==================================== */
 
     /**
-     * @notice List an NFT for sale.
-     * @param tokenAddress The ERC721 token contract address.
+     * @notice List an external ERC721 NFT for sale.
+     * @param tokenAddress The external ERC721 token contract address.
      * @param tokenId The token ID to be listed.
      * @param price The sale price in wei.
      */
@@ -125,10 +127,10 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     ) external whenNotPaused nonReentrant onlyVerified {
         require(price > 0, "Price must be greater than zero");
         require(tokenAddress != address(0), "Invalid token address");
-        require(
-            _findTokenById((tokenId)) == address(0),
-            "Token is already listed"
-        );
+
+        // Use mapping to check if this token is already listed.
+        bytes32 key = keccak256(abi.encodePacked(tokenAddress, tokenId));
+        require(!_isListed[key], "Token is already listed");
 
         require(
             IERC721(tokenAddress).ownerOf(tokenId) == msg.sender,
@@ -148,24 +150,26 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
             price: price,
             isSold: false
         });
-        // Mint a regular badge if this is the seller's first sale
+        // Mark token as listed for faster lookup (optimized over iterating through listings)
+        _isListed[key] = true;
+
+        // Issue a regular badge if this is the seller's first sale.
         if (sellers[msg.sender].saleCount == 0) {
             itemToken.mintRegular(msg.sender);
         }
 
-        // Transfer the NFT from the seller to the marketplace.
-        // Seller must have approved the marketplace contract.
+        // Transfer the external NFT from the seller to the marketplace.
         IERC721(tokenAddress).safeTransferFrom(
             msg.sender,
             address(this),
             tokenId
         );
 
-        emit ItemListed(newListingId, msg.sender, tokenAddress, tokenId, price); //
+        emit ItemListed(newListingId, msg.sender, tokenAddress, tokenId, price);
     }
 
     /**
-     * @notice Revoke a listing and return the NFT to the seller.
+     * @notice Revoke a listing and return the external NFT to the seller.
      * @param listingId The ID of the listing to revoke.
      */
     function revokeItem(
@@ -177,17 +181,24 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
 
         uint256 sale = 0;
         if (sellers[msg.sender].isGolden) {
-            sale = feeManager.getRevokeFee(); //golden sellers get 100% discount on revoke fee
+            sale = feeManager.getRevokeFee();
         } else if (sellers[msg.sender].isSilver) {
             sale = feeManager.getRevokeFee() / 2;
         }
         uint256 revokeFee = feeManager.calculateRevokeFee(listing.price, sale);
         require(msg.value >= revokeFee, "Insufficient funds for revoke");
+
+        // Save token info before deletion.
+        bytes32 key = keccak256(
+            abi.encodePacked(listing.tokenAddress, listing.tokenId)
+        );
         address tokenAddress = listing.tokenAddress;
         uint256 tokenId = listing.tokenId;
+        // Remove from listing mapping and mark as not listed.
         delete listings[listingId];
+        _isListed[key] = false;
 
-        // Transfer NFT back to seller
+        // Transfer the external NFT back to the seller.
         IERC721(tokenAddress).safeTransferFrom(
             address(this),
             msg.sender,
@@ -197,7 +208,7 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     }
 
     /**
-     * @notice Buy an NFT from the marketplace.
+     * @notice Buy an external NFT from the marketplace.
      * @param listingId The ID of the listing to buy.
      */
     function buyItem(
@@ -211,16 +222,12 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
         listing.isSold = true;
         sellers[listing.seller].saleCount++;
 
-        uint256 feeAmount = feeManager.calculateFee(listing.price, 0);
-        uint256 sellerAmount = listing.price - feeAmount;
-        sellers[listing.seller].withdrawAmount += sellerAmount;
-
-        // Give them badges if earned
+        // Issue badge upgrades based on sales count.
         if (
             sellers[listing.seller].saleCount >= 20 &&
             !sellers[listing.seller].isGolden
         ) {
-            this._issueGoldBadge(listing.seller);
+            _issueGoldBadge(listing.seller);
         } else if (
             sellers[listing.seller].saleCount >= 10 &&
             !sellers[listing.seller].isSilver
@@ -228,13 +235,16 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
             _issueSilverBadge(listing.seller);
         }
 
-        // Transfer NFT to buyer
+        uint256 feeAmount = feeManager.calculateFee(listing.price, 0);
+        uint256 sellerAmount = listing.price - feeAmount;
+        sellers[listing.seller].withdrawAmount += sellerAmount;
+
+        // Transfer external NFT to buyer.
         IERC721(listing.tokenAddress).safeTransferFrom(
             address(this),
             msg.sender,
             listing.tokenId
         );
-
         emit ItemSold(
             listingId,
             listing.seller,
@@ -252,8 +262,9 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
         return _listingIdCount;
     }
 
-    /** @notice  Gets the withdraw amount of the given seller.
-     * @param sellerAddress The address of the seller.
+    /**
+     * @notice Gets the withdraw amount of a seller.
+     * @param sellerAddress The seller's address.
      */
     function getSellerWithdrawAmount(
         address sellerAddress
@@ -302,23 +313,20 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
             "Insufficient withdrawable amount"
         );
         sellers[seller].withdrawAmount -= amount;
+        payable(seller).transfer(amount);
 
         emit SellerFundsWithdrawn(seller, amount);
-
-        payable(seller).transfer(amount);
     }
 
     /**
      * @notice Burn a badge token (admin only).
      * @param tokenId The ID of the token to burn.
      */
-
-    //TTT BUG admin cannot burn from here
     function burnBadge(uint256 tokenId) external onlyAdmin {
         itemToken.burn(tokenId);
     }
 
-    //TODO: remove these functions before deploying to mainnet
+    // The following getter functions are for testing purposes.
     function getTokenContractAddress() external view returns (address) {
         return address(itemToken);
     }
@@ -335,34 +343,14 @@ contract Marketplace is ReentrancyGuard, Pausable, IERC721Receiver {
     /*         INTERNAL FUNCTIONS           */
     /* ==================================== */
 
-    /**
-     * @notice Issue a gold badge to a recipient.
-     * @param recipient The address to receive the gold badge.
-     */
-    function _issueGoldBadge(address recipient) external {
-        //is external for testing only
+    function _issueGoldBadge(address recipient) internal {
         itemToken.mintGold(recipient);
+        sellers[recipient].isGolden = true;
     }
 
-    /**
-     * @notice Issue a silver badge to a recipient.
-     * @param recipient The address to receive the silver badge.
-     */
     function _issueSilverBadge(address recipient) internal {
         itemToken.mintSilver(recipient);
-    }
-
-    /**
-     * @notice Find a token by its ID.
-     * @param tokenId The ID of the token to find.
-     */
-    function _findTokenById(uint256 tokenId) internal view returns (address) {
-        for (uint256 i = 0; i < _listingIdCount; i++) {
-            if (listings[i].tokenId == tokenId) {
-                return listings[i].tokenAddress;
-            }
-        }
-        return address(0);
+        sellers[recipient].isSilver = true;
     }
 
     /**
